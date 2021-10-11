@@ -703,6 +703,7 @@ pub mod tests {
     use enr::NodeId;
     use quickcheck::*;
     use rand_07::Rng;
+    use std::sync::Mutex;
     use std::{
         collections::{HashSet, VecDeque},
         hash::Hash,
@@ -737,6 +738,7 @@ pub mod tests {
             self.check_first_connected_pos();
             self.check_status_ordering();
             self.check_max_incoming_nodes();
+            self.check_no_duplicates();
         }
 
         /// Check that the cached `first_connected_pos` field matches the list of nodes.
@@ -767,6 +769,22 @@ pub mod tests {
                 .filter(|n| n.status.is_connected() && n.status.is_incoming())
                 .count();
             assert!(number_of_incoming_nodes <= self.max_incoming);
+        }
+
+        /// Check that all nodes in the bucket and pending are unique.
+        fn check_no_duplicates(&self) {
+            let pending_node_key = self.pending.as_ref().map(|pending| &pending.node.key);
+            let all_node_keys = self
+                .nodes
+                .iter()
+                .map(|node| &node.key)
+                .chain(pending_node_key.into_iter())
+                .collect::<Vec<_>>();
+
+            for key in &all_node_keys {
+                let count = all_node_keys.iter().filter(|k| *k == key).count();
+                assert_eq!(count, 1, "key {:?} is present more than once", key);
+            }
         }
     }
 
@@ -863,6 +881,29 @@ pub mod tests {
     {
         fn filter(&self, value: &T, _: &mut dyn Iterator<Item = &T>) -> bool {
             self.set.contains(value)
+        }
+    }
+
+    /// Filter that returns a bool from a pre-determined list each time it is called.
+    #[derive(Debug)]
+    pub struct BitVecFilter {
+        bits: Mutex<Vec<bool>>,
+    }
+
+    impl Clone for BitVecFilter {
+        fn clone(&self) -> Self {
+            let bits = Mutex::new(self.bits.lock().unwrap().clone());
+            Self { bits }
+        }
+    }
+
+    impl<T> Filter<T> for BitVecFilter
+    where
+        T: Clone + Hash + Eq + Send + Sync + 'static,
+    {
+        fn filter(&self, _: &T, _: &mut dyn Iterator<Item = &T>) -> bool {
+            let mut vec = self.bits.lock().unwrap();
+            vec.pop().unwrap_or(false)
         }
     }
 
@@ -1223,6 +1264,37 @@ pub mod tests {
             actions: Vec<Action<u8>>,
         ) -> bool {
             let filter = SetFilter { set: filter_set };
+            let pending_timeout = Duration::from_millis(pending_timeout_millis);
+            let mut kbucket =
+                KBucket::<NodeId, u8>::new(pending_timeout, max_incoming, Some(Box::new(filter)));
+
+            for node in initial_nodes {
+                let _ = kbucket.insert(node);
+            }
+
+            for action in actions {
+                kbucket.apply_action(action);
+                kbucket.check_invariants();
+            }
+            true
+        }
+
+        quickcheck(prop as fn(_, _, _, _, _) -> _);
+    }
+
+    /// Hammer a bucket with random mutations to ensure invariants are always maintained.
+    #[test]
+    fn random_actions_with_random_filtering() {
+        fn prop(
+            initial_nodes: Vec<Node<NodeId, u8>>,
+            pending_timeout_millis: u64,
+            max_incoming: usize,
+            filter_vec: Vec<bool>,
+            actions: Vec<Action<u8>>,
+        ) -> bool {
+            let filter = BitVecFilter {
+                bits: Mutex::new(filter_vec),
+            };
             let pending_timeout = Duration::from_millis(pending_timeout_millis);
             let mut kbucket =
                 KBucket::<NodeId, u8>::new(pending_timeout, max_incoming, Some(Box::new(filter)));
